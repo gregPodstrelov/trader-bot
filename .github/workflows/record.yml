@@ -1,0 +1,37 @@
+# .github/workflows/record.yml
+# Runs both recorders on GitHub's free servers in ~6-hour shifts, 4 times a day.
+# Each shift's CSV files are saved as a downloadable "artifact" (kept 90 days).
+name: record-market-data
+
+on:
+  schedule:
+    - cron: "0 0,6,12,18 * * *"   # every 6 hours (UTC); GitHub may start a few minutes late
+  workflow_dispatch:               # adds a "Run workflow" button for manual starts
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360           # GitHub's max per job
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: pip install websockets pandas numpy certifi
+
+      - name: Record spot + Kalshi prices (~5h50m)
+        run: |
+          python -u lag_lab.py record --minutes 350 &
+          python -u kalshi_recorder.py record --minutes 350 &
+          wait
+
+      - name: Save data
+        if: always()               # save whatever was recorded even if something failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-${{ github.run_number }}-${{ github.run_id }}
+          path: "*.csv"
+          retention-days: 90
