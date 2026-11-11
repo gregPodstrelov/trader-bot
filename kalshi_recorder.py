@@ -65,6 +65,30 @@ def fetch_series(series):
     return series, (data or {}).get("markets", [])
 
 
+def discover_series(series):
+    """Current + upcoming markets (open within the next ~45 min)."""
+    now = int(time.time())
+    data = get(f"/markets?series_ticker={series}&min_close_ts={now}&max_close_ts={now + 2700}&limit=20")
+    return series, (data or {}).get("markets", [])
+
+
+def _ts(iso):
+    if not iso:
+        return float("inf")
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def best_quotes(book):
+    """Kalshi books list YES bids and NO bids only. YES ask = 1 - best NO bid."""
+    ob = (book or {}).get("orderbook_fp") or {}
+    yes = [(float(p), float(q)) for p, q in (ob.get("yes_dollars") or [])]
+    no = [(float(p), float(q)) for p, q in (ob.get("no_dollars") or [])]
+    yb = max(yes) if yes else (None, None)
+    nb = max(no) if no else (None, None)
+    ya = (round(1 - nb[0], 4), nb[1]) if nb[0] is not None else (None, None)
+    return yb[0], yb[1], ya[0], ya[1]
+
+
 # --------------------------------------------------------------------------- record
 def record(minutes, ticks_file, settle_file):
     end = time.time() + minutes * 60
@@ -87,23 +111,38 @@ def record(minutes, ticks_file, settle_file):
     if sf.tell() == 0:
         sw.writerow(["ticker", "series", "close_time", "floor_strike", "expiration_value", "result"])
 
-    pool = ThreadPoolExecutor(len(SERIES))
+    # NOTE: the /markets list is cached by Kalshi (~30s), so it is used ONLY to discover
+    # tickers, open/close times and strikes. Live prices come from /markets/{ticker}/orderbook.
+    pool = ThreadPoolExecutor(len(SERIES) * 2)
+    known = {}            # ticker -> market dict (from discovery)
+    last_discovery = 0
     print(f"Recording until {datetime.fromtimestamp(end):%H:%M:%S}  (Ctrl+C to stop early)")
     try:
         while time.time() < end:
             t0 = time.time()
-            for series, mkts in pool.map(fetch_series, SERIES):
-                for m in mkts:
-                    tw.writerow([f"{t0:.3f}", series, m.get("ticker"), m.get("status"),
-                                 m.get("open_time"), m.get("close_time"), m.get("floor_strike"),
-                                 m.get("yes_bid_dollars"), m.get("yes_ask_dollars"),
-                                 m.get("yes_bid_size_fp"), m.get("yes_ask_size_fp"),
-                                 m.get("last_price_dollars"), m.get("volume_fp")])
-                    n += 1
-                    tk = m.get("ticker")
-                    if tk and tk not in settled and m.get("close_time"):
-                        ct = datetime.fromisoformat(m["close_time"].replace("Z", "+00:00")).timestamp()
-                        pending[tk] = (series, ct)
+            if t0 - last_discovery > 20:
+                for series, mkts in pool.map(discover_series, SERIES):
+                    for m in mkts:
+                        m["_series"] = series
+                        old = known.get(m["ticker"], {})
+                        if m.get("floor_strike") is None and old.get("floor_strike") is not None:
+                            m["floor_strike"] = old["floor_strike"]
+                        known[m["ticker"]] = m
+                last_discovery = t0
+                for tk in [tk for tk, m in known.items() if _ts(m.get("close_time")) < t0 - 3600]:
+                    known.pop(tk)
+
+            active = [m for m in known.values()
+                      if _ts(m.get("open_time")) <= t0 < _ts(m.get("close_time"))]
+            for m, book in zip(active, pool.map(lambda m: get(f"/markets/{m['ticker']}/orderbook?depth=5"), active)):
+                yb, yb_sz, ya, ya_sz = best_quotes(book)
+                tw.writerow([f"{time.time():.3f}", m["_series"], m["ticker"], "active",
+                             m.get("open_time"), m.get("close_time"), m.get("floor_strike"),
+                             yb, ya, yb_sz, ya_sz, "", ""])
+                n += 1
+                tk = m["ticker"]
+                if tk not in settled:
+                    pending[tk] = (m["_series"], _ts(m.get("close_time")))
 
             # look up results of markets that closed > 60s ago
             now = time.time()
@@ -151,6 +190,12 @@ def analyze(spot_file, kalshi_file, move_bps):
 
     # Kalshi snapshots: keep the market closing soonest for each series each second
     k = pd.read_csv(kalshi_file)
+    # strikes are often missing right after a window opens: backfill from settlements
+    import os
+    sfile = os.path.join(os.path.dirname(kalshi_file) or ".", "kalshi_settlements.csv")
+    if os.path.exists(sfile):
+        st = pd.read_csv(sfile).drop_duplicates("ticker").set_index("ticker")["floor_strike"]
+        k["floor_strike"] = k["floor_strike"].fillna(k["ticker"].map(st))
     k = k.dropna(subset=["yes_bid", "yes_ask", "floor_strike"])
     k = k[(k["yes_bid"] > 0) & (k["yes_ask"] < 1)]
     k["ts"] = pd.to_datetime(k["recv_ts"], unit="s").dt.floor("1s")
