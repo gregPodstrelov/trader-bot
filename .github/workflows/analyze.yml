@@ -1,0 +1,55 @@
+# .github/workflows/analyze.yml
+# Combines every order-book recording (run #4 onward) and runs the backtests on GitHub's servers.
+# Results are committed to results/strategy_results.md in this repo.
+name: analyze-strategies
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 13 * * 0"      # also once a week (Sunday 8:30am ET) as more data arrives
+
+permissions:
+  contents: write     # to commit the results file
+  actions: read       # to download the recording artifacts
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: pip install pandas numpy
+
+      - name: Download order-book recordings (data-4 and later)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p runs
+          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired | not) | select(.name | startswith("data-")) | [.id, .name] | @tsv' > artifacts.tsv
+          while IFS=$'\t' read -r id name; do
+            n=${name#data-}; n=${n%%-*}
+            if [ "$n" -ge 4 ]; then
+              gh api "repos/$REPO/actions/artifacts/$id/zip" > a.zip
+              mkdir -p "runs/$name" && unzip -q -o a.zip -d "runs/$name" && rm a.zip
+            fi
+          done < artifacts.tsv
+          echo "Downloaded $(ls runs | wc -l) runs"; du -sh runs
+
+      - name: Run backtests
+        run: python -u strategy_lab.py --dirs runs/* --out results/strategy_results.md
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add results/
+          git commit -m "Strategy results $(date -u +%Y-%m-%d)" || echo "no change"
+          git pull --rebase && git push
