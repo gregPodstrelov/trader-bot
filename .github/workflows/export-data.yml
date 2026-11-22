@@ -1,0 +1,35 @@
+# Manual one-off: copy recorder artifacts (runs 4+, the order-book recorder) to a "data" branch
+name: export-data
+on: workflow_dispatch
+permissions:
+  contents: write
+  actions: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir out && cd out
+          gh api --paginate "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.expired | not) | [.id, .name] | @tsv' > ../list.tsv
+          while IFS=$'\t' read -r id name; do
+            n=$(echo "$name" | cut -d- -f2)
+            if [ "$n" -ge 4 ]; then
+              mkdir -p "run-$n"
+              gh api "repos/${{ github.repository }}/actions/artifacts/$id/zip" > ../a.zip
+              unzip -q -o ../a.zip -d "run-$n"
+              gzip -9 run-$n/*.csv
+            fi
+          done < ../list.tsv
+          du -sh . && ls
+      - name: Push to data branch
+        run: |
+          cd out
+          git init -q -b data
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A && git commit -qm "Recorder data, runs 4+"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
