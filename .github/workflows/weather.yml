@@ -1,0 +1,52 @@
+# .github/workflows/weather.yml
+# Every 30 minutes: snapshot Kalshi temperature markets + forecasts, append to the "weather-data" branch.
+name: record-weather
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"        # every 30 min (off the hour to dodge GitHub's busiest minute)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weather-recorder
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Get the weather-data branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          if git ls-remote --exit-code --heads "$URL" weather-data >/dev/null; then
+            git clone --quiet --single-branch --branch weather-data --depth 1 "$URL" wdata
+          else
+            mkdir wdata && cd wdata && git init -q -b weather-data && git remote add origin "$URL"
+            echo "# Weather market snapshots (written by record-weather workflow)" > README.md
+          fi
+
+      - name: Snapshot markets and forecasts
+        run: python -u weather_recorder.py --out wdata
+
+      - name: Save to weather-data branch
+        if: always()
+        run: |
+          cd wdata
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "snapshot $(date -u +%Y-%m-%dT%H:%MZ)" || { echo "nothing to save"; exit 0; }
+          for i in 1 2 3; do git push -q origin weather-data && break; git pull -q --rebase origin weather-data; done
