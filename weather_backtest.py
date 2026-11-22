@@ -107,11 +107,13 @@ def fetch(days, out):
         hist = paged("/historical/markets", "markets", {"series_ticker": series, "min_close_ts": start})
         mk = {m["ticker"]: (m, False) for m in hist}
         mk.update({m["ticker"]: (m, True) for m in live})
-        print(f"{series}: {len(live)} live + {len(hist)} historical settled brackets")
+        ct = lambda m: int(datetime.fromisoformat(m["close_time"].replace("Z", "+00:00")).timestamp()) if m.get("close_time") else 0
+        mk = {tk: v for tk, v in mk.items() if ct(v[0]) >= start}     # historical endpoint ignores min_close_ts
+        print(f"{series}: {len(live)} live + {len(hist)} historical settled brackets; {len(mk)} within {days} days")
         for tk, (m, is_live) in mk.items():
             if m.get("result") not in ("yes", "no"):
                 continue
-            close = int(datetime.fromisoformat(m["close_time"].replace("Z", "+00:00")).timestamp())
+            close = ct(m)
             mrows.append([series, m.get("event_ticker"), tk, m.get("strike_type"), m.get("floor_strike"),
                           m.get("cap_strike"), m["close_time"], m["result"], m.get("expiration_value")])
             path = (f"/series/{series}/markets/{tk}/candlesticks" if is_live
